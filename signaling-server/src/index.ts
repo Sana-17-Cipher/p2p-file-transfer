@@ -1,75 +1,125 @@
-import { WebSocketServer, WebSocket } from 'ws';
-import { randomUUID } from 'crypto';
-import type { ClientMessage, ServerMessage } from './types.js';
+import { WebSocketServer, WebSocket } from "ws";
+import { randomUUID } from "node:crypto";
+import { CloseCode } from "./types.js";
+import type { ClientMessage, ServerMessage } from "./types.js";
+const PORT = Number(process.env.PORT ?? 8080);
+const MAX_PEERS = 2;
+const HEARTBEAT_MS = 10_000;
+const allowedOrigins = (process.env.ALLOWED_ORIGINS ?? "http://localhost:5173").split(",");
 
-const PORT = 8080;
-const wss = new WebSocketServer({ port: PORT });
-
-// Map<roomId, Map<peerId, socket>>
-const rooms = new Map<string, Map<string, WebSocket>>();
-
-function send(socket: WebSocket, message: ServerMessage) {
-  socket.send(JSON.stringify(message));
+interface Peer {
+  id: string;
+  ws: WebSocket;
+  roomId: string | null;
+  alive: boolean;
 }
 
-wss.on('connection', (socket: WebSocket) => {
-  const peerId = randomUUID();
-  let currentRoomId: string | null = null;
+const rooms = new Map<string, Map<string, Peer>>();
 
-  console.log(`Peer connected: ${peerId}`);
+function send(ws: WebSocket, msg: ServerMessage) {
+  if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
+}
 
-  socket.on('message', (data) => {
-    let message: ClientMessage;
+function joinRoom(peer: Peer, roomId: unknown) {
+  if (typeof roomId !== "string" || !roomId.trim() || peer.roomId) {
+    peer.ws.close(CloseCode.BadMessage, "bad join");
+    return;
+  }
+  let room = rooms.get(roomId);
+  if (!room) {
+    room = new Map();
+    rooms.set(roomId, room);
+  }
+  if (room.size >= MAX_PEERS) {
+    peer.ws.close(CloseCode.RoomFull, "room full");
+    return;
+  }
+  const others = [...room.keys()];
+  room.set(peer.id, peer);
+  peer.roomId = roomId;
+
+  send(peer.ws, { type: "joined", peerId: peer.id, peers: others });
+  for (const other of room.values()) {
+    if (other.id !== peer.id) send(other.ws, { type: "peer-joined", peerId: peer.id });
+  }
+}
+
+function leaveRoom(peer: Peer) {
+  if (!peer.roomId) return;
+  const room = rooms.get(peer.roomId);
+  if (!room) return;
+  room.delete(peer.id);
+  if (room.size === 0) rooms.delete(peer.roomId);
+  for (const other of room.values()) {
+    send(other.ws, { type: "peer-left", peerId: peer.id });
+  }
+  peer.roomId = null;
+}
+
+function relay(peer: Peer, msg: Extract<ClientMessage, { type: "offer" | "answer" | "ice-candidate" }>) {
+  if (!peer.roomId) return;
+  const room = rooms.get(peer.roomId);
+  if (!room) return;
+  for (const other of room.values()) {
+    if (other.id === peer.id) continue;
+    if (msg.type === "ice-candidate") {
+      send(other.ws, { type: "ice-candidate", from: peer.id, candidate: msg.candidate });
+    } else {
+      send(other.ws, { type: msg.type, from: peer.id, sdp: msg.sdp });
+    }
+  }
+}
+
+const wss = new WebSocketServer({ port: PORT });
+
+wss.on("connection", (ws, req) => {
+  if (!allowedOrigins.includes(req.headers.origin ?? "")) {
+    ws.close(CloseCode.OriginNotAllowed, "origin not allowed");
+    return;
+  }
+
+  const peer: Peer = { id: randomUUID(), ws, roomId: null, alive: true };
+
+  ws.on("pong", () => {
+    peer.alive = true;
+  });
+
+  ws.on("message", (data) => {
+    let msg: ClientMessage;
     try {
-      message = JSON.parse(data.toString());
+      msg = JSON.parse(data.toString());
     } catch {
-      console.log('Received invalid JSON, ignoring');
+      ws.close(CloseCode.BadMessage, "invalid json");
       return;
     }
-
-    if (message.type === 'join-room') {
-      const { roomId } = message;
-
-      let room = rooms.get(roomId);
-      if (!room) {
-        room = new Map();
-        rooms.set(roomId, room);
-      }
-
-      if (room.size >= 2) {
-        send(socket, { type: 'room-full' });
-        return;
-      }
-
-      // Notify existing peer(s) in the room that a new peer joined
-      for (const existingPeerId of room.keys()) {
-        const existingSocket = room.get(existingPeerId)!;
-        send(existingSocket, { type: 'peer-joined', peerId });
-      }
-
-      room.set(peerId, socket);
-      currentRoomId = roomId;
-
-      send(socket, { type: 'joined-room', roomId, peerId });
-      console.log(`Peer ${peerId} joined room ${roomId} (size: ${room.size})`);
+    switch (msg?.type) {
+      case "join-room":
+        return joinRoom(peer, msg.roomId);
+      case "offer":
+      case "answer":
+      case "ice-candidate":
+        return relay(peer, msg);
+      default:
+        ws.close(CloseCode.BadMessage, "unknown message type");
     }
   });
 
-  socket.on('close', () => {
-    console.log(`Peer disconnected: ${peerId}`);
-    if (currentRoomId) {
-      const room = rooms.get(currentRoomId);
-      if (room) {
-        room.delete(peerId);
-        for (const remainingSocket of room.values()) {
-          send(remainingSocket, { type: 'peer-left', peerId });
-        }
-        if (room.size === 0) {
-          rooms.delete(currentRoomId);
-        }
-      }
-    }
-  });
+  ws.on("close", () => leaveRoom(peer));
+  ws.on("error", () => ws.terminate());
 });
 
-console.log(`Signaling server listening on ws://localhost:${PORT}`);
+// Heartbeat: drop peers that stop answering pings (closed laptop lid, dead wifi)
+setInterval(() => {
+  for (const room of rooms.values()) {
+    for (const p of room.values()) {
+      if (!p.alive) {
+        p.ws.terminate();
+        continue;
+      }
+      p.alive = false;
+      p.ws.ping();
+    }
+  }
+}, HEARTBEAT_MS);
+
+console.log(`Signaling server on ws://localhost:${PORT}`);
