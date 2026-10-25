@@ -17,7 +17,9 @@ function inviteLink(room: string): string {
 
 export default function App() {
   const { status, progress, log, received, join, leave, sendFile } = usePeerTransfer();
-  const [room, setRoom] = useState<string | null>(null);
+  const [room, setRoom] = useState<string | null>(() =>
+  new URLSearchParams(window.location.search).get("room")
+);
   const [codeInput, setCodeInput] = useState("");
   const [copied, setCopied] = useState(false);
 
@@ -42,8 +44,8 @@ export default function App() {
 
   // Opening an invite link joins its room automatically
   useEffect(() => {
-    const code = new URLSearchParams(window.location.search).get("room");
-    if (code) enter(code);
+    
+    if (room) join(room);
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
