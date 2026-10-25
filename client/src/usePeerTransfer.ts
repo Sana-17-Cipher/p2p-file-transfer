@@ -1,7 +1,30 @@
 import { useEffect, useRef, useState } from "react";
 
 const SIGNAL_URL = import.meta.env.VITE_SIGNAL_URL ?? "ws://localhost:8080";
-const ICE_SERVERS: RTCIceServer[] = [{ urls: "stun:stun.l.google.com:19302" }];
+function loadIceServers(): RTCIceServer[] {
+  const stun: RTCIceServer = { urls: "stun:stun.l.google.com:19302" };
+  const username = import.meta.env.VITE_TURN_USERNAME;
+  const credential = import.meta.env.VITE_TURN_PASSWORD;
+  if (!username || !credential) return [stun];
+
+  return [
+    stun,
+    { urls: "stun:stun.relay.metered.ca:80" },
+    {
+      urls: [
+        "turn:global.relay.metered.ca:80",
+        "turn:global.relay.metered.ca:80?transport=tcp",
+        "turn:global.relay.metered.ca:443",
+        "turns:global.relay.metered.ca:443?transport=tcp",
+      ],
+      username,
+      credential,
+    },
+  ];
+}
+
+const ICE_SERVERS = loadIceServers();
+
 const CHUNK_SIZE = 16 * 1024;
 const HIGH_WATER = 1024 * 1024;
 const LOW_WATER = 256 * 1024;
